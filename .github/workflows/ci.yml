@@ -163,4 +163,5 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-        run: ./mvnw sonar:sonar -Dsonar.projectKey=mechket266_spring-devops -Dsonar.host.url=$SONAR_HOST_URL
+          SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+        run: ./mvnw sonar:sonar -Dsonar.projectKey=mechket266_spring-devops -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.organization=$SONAR_ORGANIZATION
