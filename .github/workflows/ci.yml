@@ -54,6 +54,7 @@ jobs:
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-latest
+    needs: build-test
     
     steps:
       - name: Checkout code
@@ -75,6 +76,7 @@ jobs:
   dependency-scan:
     name: Dependency Scan
     runs-on: ubuntu-latest
+    needs: build-test
     
     steps:
       - name: Checkout code
@@ -110,6 +112,7 @@ jobs:
   security-scan:
     name: Security SAST Scan
     runs-on: ubuntu-latest
+    needs: build-test
     
     steps:
       - name: Checkout code
