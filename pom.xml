@@ -293,6 +293,12 @@
         </executions>
       </plugin>
 
+      <plugin>
+        <groupId>org.sonarsource.scanner.maven</groupId>
+        <artifactId>sonar-maven-plugin</artifactId>
+        <version>4.0.0.4129</version>
+      </plugin>
+
       <!-- Spring Boot Actuator displays build-related information if a git.properties file is
       present at the classpath -->
       <plugin>
