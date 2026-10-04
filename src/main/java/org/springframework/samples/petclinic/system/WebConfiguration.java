@@ -84,15 +84,19 @@ public class WebConfiguration implements WebMvcConfigurer {
 				httpResponse.setHeader("X-Frame-Options", "DENY");
 				// X-Content-Type-Options
 				httpResponse.setHeader("X-Content-Type-Options", "nosniff");
-				// Content Security Policy
+				// Content Security Policy - improved with fallback directives
 				httpResponse.setHeader("Content-Security-Policy",
-						"default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;");
+						"default-src 'self' 'unsafe-inline' 'unsafe-eval'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; font-src 'self' data: https:; connect-src 'self' https:; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';");
 				// Permissions Policy
-				httpResponse.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+				httpResponse.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()");
 				// Cross-Origin-Embedder-Policy
 				httpResponse.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+				// Cross-Origin-Opener-Policy
+				httpResponse.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+				// Referrer-Policy
+				httpResponse.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
 				// Cache control for non-storable content
-				httpResponse.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+				httpResponse.setHeader("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0");
 				httpResponse.setHeader("Pragma", "no-cache");
 				httpResponse.setHeader("Expires", "0");
 				chain.doFilter(request, response);
