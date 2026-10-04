@@ -1,0 +1,31 @@
+# Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# GitLab CI reports (générés par le pipeline)
+gl-secret-detection-report.json
+semgrep-report.json
+trivy-sca-report.json
+trivy-iac-report.json
+trivy-image-report.json
+
+# Logs
+*.log
