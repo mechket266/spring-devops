@@ -169,7 +169,7 @@ jobs:
   dast:
     name: DAST Scan
     runs-on: ubuntu-latest
-    needs: build-test
+    needs: [build-test, secret-scan, dependency-scan, security-scan, sonarcloud]
     
     steps:
       - name: Checkout code
@@ -203,6 +203,7 @@ jobs:
           target: 'http://localhost:8080'
           rules_file_name: '.zap/rules.tsv'
           cmd_options: '-a'
+          docker_name: 'zaproxy/zaproxy:stable'
       
       - name: Stop application
         if: always()
