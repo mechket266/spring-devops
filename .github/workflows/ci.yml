@@ -1,46 +1,69 @@
-name: CI Pipeline
+# ==================================================================
+# Pipeline DevSecOps - Spring PetClinic
+# Build -> Scans (secrets, SAST, SCA) -> Docker build + scan image
+#       -> DAST sur l'image -> Push Docker Hub -> Deploy staging Render
+# ==================================================================
+name: DevSecOps Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
+  workflow_dispatch:
 
+# Annule un run en cours si un nouveau push arrive sur la même branche
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Moindre privilège par défaut
 permissions:
   contents: read
-  security-events: write
+  security-events: write # upload SARIF -> onglet Security
+  actions: read
+
+env:
+  IMAGE_NAME: mechket968/spring-petclinic
+  TRIVY_IMAGE: aquasec/trivy:latest
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:stable
+  SEMGREP_RULES: --config p/java --config p/owasp-top-ten --config p/secrets
 
 jobs:
+  # ================================================================
+  # 1. BUILD + TESTS + COUVERTURE
+  # ================================================================
   build-test:
     name: Build and Test
     runs-on: ubuntu-latest
-    
+    permissions:
+      contents: read
+      pull-requests: write # commentaire de couverture sur les PR
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          java-version: "17"
+          distribution: "temurin"
           cache: maven
-      
+
       - name: Make Maven wrapper executable
         run: chmod +x mvnw
-      
-      - name: Build with Maven
-        run: ./mvnw clean compile
-      
-      - name: Run tests with coverage
-        run: ./mvnw test jacoco:report
-      
-      - name: Upload coverage reports
+
+      - name: Build
+        run: ./mvnw -B clean compile
+
+      - name: Tests + couverture JaCoCo
+        run: ./mvnw -B test jacoco:report
+
+      - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: target/site/jacoco/
-      
+
       - name: Comment coverage on PR
         if: github.event_name == 'pull_request'
         uses: madrapps/jacoco-report@v1.6.1
@@ -51,190 +74,392 @@ jobs:
           min-coverage-changed-files: 60
           title: Code Coverage Report
 
+  # ================================================================
+  # 2. SCAN DE SECRETS - Gitleaks (tout l'historique git)
+  #    BLOQUANT : tout secret détecté fait échouer le pipeline
+  # ================================================================
   secret-scan:
-    name: Secret Scan
+    name: Secret Scan (Gitleaks)
     runs-on: ubuntu-latest
-    needs: build-test
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Run Semgrep
-        uses: returntocorp/semgrep-action@v1
+      - uses: actions/checkout@v4
         with:
-          config: auto
-          severity: ERROR
-          sarif: true
-      
-      - name: Upload Semgrep SARIF
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo gitleaks/gitleaks --pattern '*_linux_x64.tar.gz' --output gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          rm gitleaks.tar.gz
+          gitleaks version
+
+      - name: Scan secrets (historique complet) - BLOQUANT
+        run: gitleaks detect --source . --verbose --redact --report-format sarif --report-path gitleaks.sarif
+
+      - name: Upload SARIF
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-gitleaks
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  # ================================================================
+  # 3. SAST - Semgrep (Java + OWASP Top 10 + secrets)
+  #    BLOQUANT sur sévérité ERROR
+  # ================================================================
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Rapport complet (SARIF)
+        run: semgrep scan $SEMGREP_RULES --sarif --output semgrep.sarif .
+
+      - name: Upload SARIF
         if: always() && hashFiles('semgrep.sarif') != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
+          category: semgrep
 
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-semgrep
+          path: semgrep.sarif
+          if-no-files-found: ignore
+
+      - name: QUALITY GATE - sévérité ERROR = bloquant
+        run: semgrep scan $SEMGREP_RULES --severity ERROR --error .
+
+  # ================================================================
+  # 4. SCA - dépendances Maven (Trivy)
+  #    BLOQUANT sur CRITICAL / HIGH
+  # ================================================================
   dependency-scan:
-    name: Dependency Scan
+    name: Dependency Scan (Trivy SCA)
     runs-on: ubuntu-latest
-    needs: build-test
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: maven
-      
-      - name: Make Maven wrapper executable
-        run: chmod +x mvnw
-      
-      - name: Download Maven dependencies
-        run: ./mvnw dependency:go-offline
-      
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-      
-      - name: Upload Trivy results to GitHub Security
+      - uses: actions/checkout@v4
+
+      - name: Rapports Trivy (SARIF, HTML, JSON)
+        run: |
+          mkdir -p reports
+          TRIVY="docker run --rm -w /work -v $PWD:/work -v $HOME/.cache/trivy:/root/.cache/trivy $TRIVY_IMAGE"
+          $TRIVY fs --scanners vuln --skip-dirs reports --format sarif --output reports/trivy-deps.sarif .
+          $TRIVY fs --scanners vuln --skip-dirs reports --format template --template "@/contrib/html.tpl" --output reports/trivy-deps.html .
+          $TRIVY fs --scanners vuln --skip-dirs reports --format json --output reports/trivy-deps.json .
+
+      - name: Upload SARIF
+        if: always() && hashFiles('reports/trivy-deps.sarif') != ''
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: 'trivy-results.sarif'
+          sarif_file: reports/trivy-deps.sarif
+          category: trivy-dependencies
 
-  security-scan:
-    name: Security SAST Scan
-    runs-on: ubuntu-latest
-    needs: build-test
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          name: report-trivy-dependencies
+          path: reports/
+
+      - name: QUALITY GATE - CRITICAL/HIGH = bloquant
+        run: |
+          docker run --rm -w /work -v $PWD:/work -v $HOME/.cache/trivy:/root/.cache/trivy $TRIVY_IMAGE \
+            fs --scanners vuln --skip-dirs reports --exit-code 1 --severity CRITICAL,HIGH .
+
+  # ================================================================
+  # 5. QUALITE DE CODE - SpotBugs + PMD (non bloquant, informatif)
+  # ================================================================
+  quality-scan:
+    name: Code Quality (SpotBugs + PMD)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
           cache: maven
-      
+
       - name: Make Maven wrapper executable
         run: chmod +x mvnw
-      
-      - name: Run SpotBugs
-        run: |
-          ./mvnw spotbugs:check
-        continue-on-error: true
-      
-      - name: Run PMD
-        run: |
-          ./mvnw pmd:check
+
+      - name: SpotBugs
+        run: ./mvnw -B spotbugs:check
         continue-on-error: true
 
+      - name: PMD
+        run: ./mvnw -B pmd:check
+        continue-on-error: true
+
+  # ================================================================
+  # 6. SONARCLOUD - qualité + quality gate Sonar
+  #    Non bloquant pour l'instant (passer continue-on-error à false
+  #    une fois le quality gate Sonar au vert)
+  # ================================================================
   sonarcloud:
     name: SonarCloud Scan
     runs-on: ubuntu-latest
-    needs: build-test
-    
+    continue-on-error: true
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+
+      - uses: actions/setup-java@v4
         with:
-          java-version: '21'
-          distribution: 'temurin'
+          java-version: "21"
+          distribution: "temurin"
           cache: maven
-      
+
       - name: Make Maven wrapper executable
         run: chmod +x mvnw
-      
-      - name: Run SonarCloud scan
+
+      - name: SonarCloud scan + attente du quality gate
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
-        run: ./mvnw sonar:sonar -Dsonar.projectKey=mechket266_spring-devops -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.organization=$SONAR_ORGANIZATION
+        run: >
+          ./mvnw -B sonar:sonar
+          -Dsonar.projectKey=mechket266_spring-devops
+          -Dsonar.host.url=$SONAR_HOST_URL
+          -Dsonar.organization=$SONAR_ORGANIZATION
+          -Dsonar.qualitygate.wait=true
 
-  dast:
-    name: DAST Scan
+  # ================================================================
+  # 7. DOCKER BUILD + SCAN DE L'IMAGE (Trivy) + IaC + SBOM
+  #    L'image n'est PAS poussée ici : elle doit d'abord passer le gate
+  # ================================================================
+  docker-build-scan:
+    name: Docker Build + Image Scan
     runs-on: ubuntu-latest
-    needs: [build-test, secret-scan, dependency-scan, security-scan, sonarcloud]
-    
+    needs: [build-test, secret-scan, sast, dependency-scan]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (locale, non poussée)
+        uses: docker/build-push-action@v5
         with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: maven
-      
-      - name: Make Maven wrapper executable
-        run: chmod +x mvnw
-      
-      - name: Build application
-        run: ./mvnw clean package -DskipTests
-      
-      - name: Start application in background
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan IaC (Dockerfile, docker-compose, k8s) - non bloquant
         run: |
-          nohup ./mvnw spring-boot:run > app.log 2>&1 &
-          echo $! > app.pid
-          sleep 90
-      
-      - name: Check if application is running
-        run: curl -f http://localhost:8080 || exit 1
-      
-      - name: Run OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.10.0
-        with:
-          target: 'http://localhost:8080'
-          cmd_options: '-a'
+          docker run --rm -w /work -v $PWD:/work $TRIVY_IMAGE config --exit-code 0 .
+
+      - name: Rapports image (SARIF, HTML, JSON) + SBOM CycloneDX
+        run: |
+          mkdir -p reports
+          TRIVY="docker run --rm -w /work -v /var/run/docker.sock:/var/run/docker.sock -v $PWD:/work -v $HOME/.cache/trivy:/root/.cache/trivy $TRIVY_IMAGE"
+          IMG="$IMAGE_NAME:$GITHUB_SHA"
+          $TRIVY image --format sarif --output reports/trivy-image.sarif "$IMG"
+          $TRIVY image --format template --template "@/contrib/html.tpl" --output reports/trivy-image.html "$IMG"
+          $TRIVY image --format json --output reports/trivy-image.json "$IMG"
+          $TRIVY image --format cyclonedx --output reports/sbom-cyclonedx.json "$IMG"
+
+      - name: Upload SARIF
+        if: always() && hashFiles('reports/trivy-image.sarif') != ''
         continue-on-error: true
-      
-      - name: Stop application
-        if: always()
-        run: |
-          if [ -f app.pid ]; then
-            kill $(cat app.pid) || true
-          fi
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
 
-  docker-build-push:
-    name: Build and Push Docker Image
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-trivy-image-sbom
+          path: reports/
+
+      - name: QUALITY GATE - CRITICAL avec correctif = bloquant
+        run: |
+          docker run --rm -w /work -v /var/run/docker.sock:/var/run/docker.sock -v $PWD:/work \
+            -v $HOME/.cache/trivy:/root/.cache/trivy $TRIVY_IMAGE \
+            image --exit-code 1 --severity CRITICAL --ignore-unfixed "$IMAGE_NAME:$GITHUB_SHA"
+
+      - name: Export de l'image validée
+        run: docker save "$IMAGE_NAME:$GITHUB_SHA" | gzip > image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: image.tar.gz
+          retention-days: 1
+
+  # ================================================================
+  # 8. DAST - OWASP ZAP sur l'IMAGE EXACTE qui sera déployée
+  #    Même config que le staging (console H2 désactivée)
+  #    Non bloquant : scan passif, nombreux avertissements informatifs
+  # ================================================================
+  dast:
+    name: DAST (OWASP ZAP)
     runs-on: ubuntu-latest
-    needs: [build-test, secret-scan, dependency-scan, security-scan, sonarcloud, dast]
-    if: github.ref == 'refs/heads/main'
-    
+    needs: docker-build-scan
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Login to Docker Hub
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Charger l'image
+        run: gunzip -c image.tar.gz | docker load
+
+      - name: Démarrer l'application (config staging)
+        run: |
+          docker run -d --name app -p 8080:8080 \
+            -e SPRING_H2_CONSOLE_ENABLED=false \
+            "$IMAGE_NAME:$GITHUB_SHA"
+
+      - name: Attendre le démarrage
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:8080; then echo "App prête"; exit 0; fi
+            echo "attente app... ($i)"; sleep 5
+          done
+          docker logs app
+          exit 1
+
+      - name: ZAP baseline scan
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" $ZAP_IMAGE \
+            zap-baseline.py -t http://localhost:8080 -a \
+            -r zap-report.html -J zap-report.json -w zap-report.md -I || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-zap
+          path: zap/
+
+      - name: Logs de l'application
+        if: failure()
+        run: docker logs app
+
+  # ================================================================
+  # 9. PUSH DOCKER HUB (main uniquement) - tags SHA + latest
+  # ================================================================
+  docker-push:
+    name: Push Docker Hub
+    runs-on: ubuntu-latest
+    needs: [docker-build-scan, dast]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Charger l'image validée
+        run: |
+          gunzip -c image.tar.gz | docker load
+          docker tag "$IMAGE_NAME:$GITHUB_SHA" "$IMAGE_NAME:latest"
+
+      - name: Login Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-      
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: mechket968/spring-petclinic:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+      - name: Push
+        run: |
+          docker push "$IMAGE_NAME:$GITHUB_SHA"
+          docker push "$IMAGE_NAME:latest"
+
+  # ================================================================
+  # 10. DEPLOIEMENT STAGING (Render) + SMOKE TEST
+  # ================================================================
+  deploy-staging:
+    name: Deploy Staging (Render)
+    runs-on: ubuntu-latest
+    needs: docker-push
+    environment:
+      name: staging
+      url: ${{ vars.RENDER_APP_URL }}
+    steps:
+      - name: Déployer l'image du commit
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          IMG: docker.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          ENC=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['IMG'], safe=''))")
+          curl -fsS -X POST "${HOOK}&imgURL=${ENC}" > /dev/null
+          echo "Déploiement de $IMG déclenché"
+
+      - name: Smoke test (app répond + console H2 fermée)
+        env:
+          URL: ${{ vars.RENDER_APP_URL }}
+        run: |
+          sleep 120
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null "$URL"; then echo "Staging OK"; break; fi
+            [ "$i" = "30" ] && { echo "Staging KO"; exit 1; }
+            echo "attente déploiement... ($i)"; sleep 20
+          done
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL/h2-console")
+          echo "/h2-console -> HTTP $CODE"
+          if [ "$CODE" = "200" ]; then echo "ERREUR : console H2 exposée"; exit 1; fi
+          echo "Console H2 non exposée"
+
+  # ================================================================
+  # 11. NOTIFICATION SLACK EN CAS D'ECHEC
+  #     Ignorée tant que le secret SLACK_WEBHOOK_URL n'existe pas
+  # ================================================================
+  notify:
+    name: Notification
+    runs-on: ubuntu-latest
+    needs:
+      [
+        build-test,
+        secret-scan,
+        sast,
+        dependency-scan,
+        docker-build-scan,
+        dast,
+        docker-push,
+        deploy-staging,
+      ]
+    if: always() && contains(needs.*.result, 'failure')
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          FAILED=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result=="failure") | .key' | paste -sd ", ")
+          TEXT=":rotating_light: Pipeline DevSecOps bloqué sur *${GITHUB_REPOSITORY}* (${GITHUB_REF_NAME})
+          Jobs en échec : ${FAILED}
+          Commit : ${GITHUB_SHA::7} par ${GITHUB_ACTOR}
+          ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          jq -n --arg text "$TEXT" '{text: $text}' | curl -fsS -X POST -H 'Content-type: application/json' --data @- "$SLACK_WEBHOOK_URL"
