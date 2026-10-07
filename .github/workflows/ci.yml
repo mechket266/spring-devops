@@ -230,19 +230,18 @@ jobs:
         run: ./mvnw -B pmd:check
         continue-on-error: true
 
-  # ================================================================
-  # 6. SONARCLOUD - qualité + quality gate Sonar
-  #    Non bloquant pour l'instant (passer continue-on-error à false
-  #    une fois le quality gate Sonar au vert)
+    # ================================================================
+  # 6. SONARCLOUD - qualité + couverture + quality gate Sonar
+  #    Les tests sont relancés ici pour envoyer la couverture JaCoCo
   # ================================================================
   sonarcloud:
     name: SonarCloud Scan
     runs-on: ubuntu-latest
-    continue-on-error: true
+    continue-on-error: true # passer à false une fois le quality gate au vert
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # historique complet : nécessaire pour détecter le "nouveau code"
 
       - uses: actions/setup-java@v4
         with:
@@ -253,17 +252,19 @@ jobs:
       - name: Make Maven wrapper executable
         run: chmod +x mvnw
 
-      - name: SonarCloud scan + attente du quality gate
+      - name: Tests + couverture JaCoCo + analyse SonarCloud + quality gate
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
         run: >
-          ./mvnw -B sonar:sonar
+          ./mvnw -B test jacoco:report sonar:sonar
           -Dsonar.projectKey=mechket266_spring-devops
           -Dsonar.host.url=$SONAR_HOST_URL
           -Dsonar.organization=$SONAR_ORGANIZATION
+          -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
           -Dsonar.qualitygate.wait=true
+          -Dsonar.qualitygate.timeout=300
 
   # ================================================================
   # 7. DOCKER BUILD + SCAN DE L'IMAGE (Trivy) + IaC + SBOM
