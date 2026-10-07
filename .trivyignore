@@ -1,0 +1,6 @@
+# ============================================================
+# Exemptions Trivy - voir EXEMPTIONS.md pour la procédure
+# Format : une CVE par ligne, précédée d'un commentaire :
+# <CVE> | justification | validé par | date d'expiration
+# ============================================================
+# Aucune exemption active.

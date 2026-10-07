@@ -1,6 +1,6 @@
 # ==================================================================
 # Pipeline DevSecOps - Spring PetClinic
-# Build -> Scans (secrets, SAST, SCA) -> Docker build + scan image
+# Build -> Scans (secrets, SAST, SCA, Sonar) -> Docker build + scan image
 #       -> DAST sur l'image -> Push Docker Hub -> Deploy staging Render
 # ==================================================================
 name: DevSecOps Pipeline
@@ -152,11 +152,11 @@ jobs:
       - name: QUALITY GATE - sévérité ERROR = bloquant
         run: semgrep scan $SEMGREP_RULES --severity ERROR --error .
 
-    # ================================================================
+  # ================================================================
   # 4. SCA - dépendances Maven (Trivy)
   #    BLOQUANT sur CRITICAL / HIGH
-  #    Le cache Maven est rempli AVANT le scan et Trivy tourne en
-  #    --offline-scan : pas de requêtes vers Maven Central (évite le 429)
+  #    Cache Maven rempli AVANT le scan + --offline-scan :
+  #    aucune requête vers Maven Central (évite le 429)
   # ================================================================
   dependency-scan:
     name: Dependency Scan (Trivy SCA)
@@ -230,18 +230,18 @@ jobs:
         run: ./mvnw -B pmd:check
         continue-on-error: true
 
-    # ================================================================
+  # ================================================================
   # 6. SONARCLOUD - qualité + couverture + quality gate Sonar
-  #    Les tests sont relancés ici pour envoyer la couverture JaCoCo
+  #    BLOQUANT : le quality gate Sonar doit être vert
   # ================================================================
   sonarcloud:
     name: SonarCloud Scan
     runs-on: ubuntu-latest
-    continue-on-error: true # passer à false une fois le quality gate au vert
+    continue-on-error: false # quality gate Sonar bloquant
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # historique complet : nécessaire pour détecter le "nouveau code"
+          fetch-depth: 0 # historique complet : détection du "nouveau code"
 
       - uses: actions/setup-java@v4
         with:
@@ -273,7 +273,7 @@ jobs:
   docker-build-scan:
     name: Docker Build + Image Scan
     runs-on: ubuntu-latest
-    needs: [build-test, secret-scan, sast, dependency-scan]
+    needs: [build-test, secret-scan, sast, dependency-scan, sonarcloud]
     steps:
       - uses: actions/checkout@v4
 
@@ -430,7 +430,7 @@ jobs:
           curl -fsS -X POST "${HOOK}&imgURL=${ENC}" > /dev/null
           echo "Déploiement de $IMG déclenché"
 
-      - name: Smoke test (app répond + console H2 fermée)
+      - name: Smoke test (app répond + endpoints sensibles fermés)
         env:
           URL: ${{ vars.RENDER_APP_URL }}
         run: |
@@ -440,10 +440,13 @@ jobs:
             [ "$i" = "30" ] && { echo "Staging KO"; exit 1; }
             echo "attente déploiement... ($i)"; sleep 20
           done
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL/h2-console")
-          echo "/h2-console -> HTTP $CODE"
-          if [ "$CODE" = "200" ]; then echo "ERREUR : console H2 exposée"; exit 1; fi
-          echo "Console H2 non exposée"
+          FAIL=0
+          for path in /h2-console /actuator/env /actuator/heapdump /actuator/loggers; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL$path")
+            echo "$path -> HTTP $CODE"
+            if [ "$CODE" = "200" ]; then echo "ERREUR : $path exposé"; FAIL=1; fi
+          done
+          exit $FAIL
 
   # ================================================================
   # 11. NOTIFICATION SLACK EN CAS D'ECHEC
@@ -458,6 +461,7 @@ jobs:
         secret-scan,
         sast,
         dependency-scan,
+        sonarcloud,
         docker-build-scan,
         dast,
         docker-push,

@@ -1,0 +1,6 @@
+# ============================================================
+# Exemptions Gitleaks - voir EXEMPTIONS.md pour la procédure
+# Format : une empreinte (fingerprint) par ligne, issue du rapport
+# Gitleaks, précédée d'un commentaire de justification.
+# ============================================================
+# Aucune exemption active.
