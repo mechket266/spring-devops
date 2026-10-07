@@ -152,9 +152,11 @@ jobs:
       - name: QUALITY GATE - sévérité ERROR = bloquant
         run: semgrep scan $SEMGREP_RULES --severity ERROR --error .
 
-  # ================================================================
+    # ================================================================
   # 4. SCA - dépendances Maven (Trivy)
   #    BLOQUANT sur CRITICAL / HIGH
+  #    Le cache Maven est rempli AVANT le scan et Trivy tourne en
+  #    --offline-scan : pas de requêtes vers Maven Central (évite le 429)
   # ================================================================
   dependency-scan:
     name: Dependency Scan (Trivy SCA)
@@ -162,13 +164,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Make Maven wrapper executable
+        run: chmod +x mvnw
+
+      - name: Remplir le cache Maven local
+        run: ./mvnw -B dependency:go-offline
+
       - name: Rapports Trivy (SARIF, HTML, JSON)
         run: |
           mkdir -p reports
-          TRIVY="docker run --rm -w /work -v $PWD:/work -v $HOME/.cache/trivy:/root/.cache/trivy $TRIVY_IMAGE"
-          $TRIVY fs --scanners vuln --skip-dirs reports --format sarif --output reports/trivy-deps.sarif .
-          $TRIVY fs --scanners vuln --skip-dirs reports --format template --template "@/contrib/html.tpl" --output reports/trivy-deps.html .
-          $TRIVY fs --scanners vuln --skip-dirs reports --format json --output reports/trivy-deps.json .
+          TRIVY="docker run --rm -w /work -v $PWD:/work -v $HOME/.m2:/root/.m2 -v $HOME/.cache/trivy:/root/.cache/trivy $TRIVY_IMAGE"
+          $TRIVY fs --scanners vuln --offline-scan --skip-dirs reports --format sarif --output reports/trivy-deps.sarif .
+          $TRIVY fs --scanners vuln --offline-scan --skip-dirs reports --format template --template "@/contrib/html.tpl" --output reports/trivy-deps.html .
+          $TRIVY fs --scanners vuln --offline-scan --skip-dirs reports --format json --output reports/trivy-deps.json .
 
       - name: Upload SARIF
         if: always() && hashFiles('reports/trivy-deps.sarif') != ''
@@ -186,8 +200,8 @@ jobs:
 
       - name: QUALITY GATE - CRITICAL/HIGH = bloquant
         run: |
-          docker run --rm -w /work -v $PWD:/work -v $HOME/.cache/trivy:/root/.cache/trivy $TRIVY_IMAGE \
-            fs --scanners vuln --skip-dirs reports --exit-code 1 --severity CRITICAL,HIGH .
+          docker run --rm -w /work -v $PWD:/work -v $HOME/.m2:/root/.m2 -v $HOME/.cache/trivy:/root/.cache/trivy $TRIVY_IMAGE \
+            fs --scanners vuln --offline-scan --skip-dirs reports --exit-code 1 --severity CRITICAL,HIGH .
 
   # ================================================================
   # 5. QUALITE DE CODE - SpotBugs + PMD (non bloquant, informatif)
