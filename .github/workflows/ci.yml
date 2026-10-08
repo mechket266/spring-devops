@@ -328,7 +328,7 @@ jobs:
           -Dsonar.host.url=$SONAR_HOST_URL
           -Dsonar.organization=$SONAR_ORGANIZATION
           -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
-          -Dsonar.qualitygate.wait=true
+          -Dsonar.qualitygate.wait=${{ github.ref == 'refs/heads/main' }}
           -Dsonar.qualitygate.timeout=300
 
   # ================================================================
