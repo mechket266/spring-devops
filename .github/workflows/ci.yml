@@ -1,21 +1,27 @@
 # ==================================================================
 # Pipeline DevSecOps - Spring PetClinic
-# Build -> Scans (secrets, SAST, SCA, Sonar) -> Docker build + scan image
-#       -> DAST sur l'image -> Push Docker Hub -> Deploy staging Render
+# Phases STRICTEMENT SEQUENTIELLES : chaque phase ne démarre que si
+# la précédente est validée (fail-fast : contrôles rapides d'abord)
+#
+#  1 Pre-commit + messages   2 Secrets   3 Build/Tests   4 SAST
+#  5 SCA   6 Qualité   7 SonarCloud   8 Docker build + scan image
+#  9 DAST  10 Push Docker Hub  11 Deploy staging (Render)
+#  12 Deploy prod simulée (conteneur local)
+#  13 Notification (toujours, avec le résultat de chaque phase)
 # ==================================================================
 name: DevSecOps Pipeline
 
 on:
   push:
-    branches: [main, develop]
+    branches: ["**"] # à chaque push, sur toutes les branches
   pull_request:
-    branches: [main, develop]
+    branches: [main]
   workflow_dispatch:
 
-# Annule un run en cours si un nouveau push arrive sur la même branche
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # jamais d'annulation sur main : un déploiement pourrait être coupé
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Moindre privilège par défaut
 permissions:
@@ -28,14 +34,115 @@ env:
   TRIVY_IMAGE: aquasec/trivy:latest
   ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:stable
   SEMGREP_RULES: --config p/java --config p/owasp-top-ten --config p/secrets
+  PROD_CONTAINER: petclinic-prod
+  PROD_PORT: "8081"
 
 jobs:
   # ================================================================
-  # 1. BUILD + TESTS + COUVERTURE
+  # PHASE 1 - PRE-COMMIT REJOUE COTE SERVEUR + MESSAGES DE COMMIT
+  # Un développeur peut contourner ses hooks locaux (--no-verify) :
+  # ici ils sont rejoués et NE PEUVENT PAS être contournés.
+  # ================================================================
+  precommit-check:
+    name: Pre-commit & Commit Message
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Hooks pre-commit rejoués côté serveur (non contournables)
+        env:
+          SKIP: no-commit-to-branch # ce hook n'a de sens qu'en local
+        run: pre-commit run --all-files --show-diff-on-failure
+
+      - name: Format des messages de commit (Conventional Commits)
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .{3,}'
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            RANGE="$BEFORE..$GITHUB_SHA"
+          elif [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            RANGE="origin/main..$GITHUB_SHA"
+          else
+            RANGE="$GITHUB_SHA~1..$GITHUB_SHA"
+          fi
+          echo "Commits vérifiés : $RANGE"
+          FAIL=0
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            if echo "$msg" | grep -Eq "$PATTERN"; then
+              echo "OK      : $msg"
+            else
+              echo "REFUSÉ  : $msg"
+              FAIL=1
+            fi
+          done < <(git log --no-merges --format=%s "$RANGE")
+          if [ "$FAIL" = "1" ]; then
+            echo "Format attendu : type(scope): description  -> ex. fix(deps): montée de version tomcat"
+            exit 1
+          fi
+
+  # ================================================================
+  # PHASE 2 - SCAN DE SECRETS - Gitleaks (tout l'historique git)
+  # ================================================================
+  secret-scan:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    needs: precommit-check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo gitleaks/gitleaks --pattern '*_linux_x64.tar.gz' --output gitleaks.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          rm gitleaks.tar.gz
+          gitleaks version
+
+      - name: Scan secrets (historique complet) - BLOQUANT
+        run: gitleaks detect --source . --verbose --redact --report-format sarif --report-path gitleaks.sarif
+
+      - name: Upload SARIF
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-gitleaks
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  # ================================================================
+  # PHASE 3 - BUILD + TESTS + COUVERTURE
   # ================================================================
   build-test:
     name: Build and Test
     runs-on: ubuntu-latest
+    needs: secret-scan
     permissions:
       contents: read
       pull-requests: write # commentaire de couverture sur les PR
@@ -75,52 +182,12 @@ jobs:
           title: Code Coverage Report
 
   # ================================================================
-  # 2. SCAN DE SECRETS - Gitleaks (tout l'historique git)
-  #    BLOQUANT : tout secret détecté fait échouer le pipeline
-  # ================================================================
-  secret-scan:
-    name: Secret Scan (Gitleaks)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install Gitleaks
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download --repo gitleaks/gitleaks --pattern '*_linux_x64.tar.gz' --output gitleaks.tar.gz
-          tar -xzf gitleaks.tar.gz gitleaks
-          sudo mv gitleaks /usr/local/bin/
-          rm gitleaks.tar.gz
-          gitleaks version
-
-      - name: Scan secrets (historique complet) - BLOQUANT
-        run: gitleaks detect --source . --verbose --redact --report-format sarif --report-path gitleaks.sarif
-
-      - name: Upload SARIF
-        if: always() && hashFiles('gitleaks.sarif') != ''
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: gitleaks.sarif
-          category: gitleaks
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: report-gitleaks
-          path: gitleaks.sarif
-          if-no-files-found: ignore
-
-  # ================================================================
-  # 3. SAST - Semgrep (Java + OWASP Top 10 + secrets)
-  #    BLOQUANT sur sévérité ERROR
+  # PHASE 4 - SAST - Semgrep (bloquant sur sévérité ERROR)
   # ================================================================
   sast:
     name: SAST (Semgrep)
     runs-on: ubuntu-latest
+    needs: build-test
     steps:
       - uses: actions/checkout@v4
 
@@ -153,14 +220,13 @@ jobs:
         run: semgrep scan $SEMGREP_RULES --severity ERROR --error .
 
   # ================================================================
-  # 4. SCA - dépendances Maven (Trivy)
-  #    BLOQUANT sur CRITICAL / HIGH
-  #    Cache Maven rempli AVANT le scan + --offline-scan :
-  #    aucune requête vers Maven Central (évite le 429)
+  # PHASE 5 - SCA - Trivy (bloquant sur CRITICAL/HIGH)
+  # Cache Maven + --offline-scan : pas de requêtes Maven Central (429)
   # ================================================================
   dependency-scan:
     name: Dependency Scan (Trivy SCA)
     runs-on: ubuntu-latest
+    needs: sast
     steps:
       - uses: actions/checkout@v4
 
@@ -204,12 +270,12 @@ jobs:
             fs --scanners vuln --offline-scan --skip-dirs reports --exit-code 1 --severity CRITICAL,HIGH .
 
   # ================================================================
-  # 5. QUALITE DE CODE - SpotBugs + PMD (non bloquant, informatif)
+  # PHASE 6 - QUALITE DE CODE - SpotBugs + PMD (informatif)
   # ================================================================
   quality-scan:
     name: Code Quality (SpotBugs + PMD)
     runs-on: ubuntu-latest
-    continue-on-error: true
+    needs: dependency-scan
     steps:
       - uses: actions/checkout@v4
 
@@ -230,18 +296,17 @@ jobs:
         run: ./mvnw -B pmd:check
         continue-on-error: true
 
-  # ================================================================
-  # 6. SONARCLOUD - qualité + couverture + quality gate Sonar
-  #    BLOQUANT : le quality gate Sonar doit être vert
+    # ================================================================
+  # PHASE 7 - SONARCLOUD - couverture + quality gate (bloquant sur main)
   # ================================================================
   sonarcloud:
     name: SonarCloud Scan
     runs-on: ubuntu-latest
-    continue-on-error: false # quality gate Sonar bloquant
+    needs: quality-scan
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # historique complet : détection du "nouveau code"
+          fetch-depth: 0
 
       - uses: actions/setup-java@v4
         with:
@@ -257,23 +322,24 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+          # quality gate attendu uniquement sur main (limite offre gratuite)
+          QG_WAIT: ${{ github.ref == 'refs/heads/main' }}
         run: >
           ./mvnw -B test jacoco:report sonar:sonar
           -Dsonar.projectKey=mechket266_spring-devops
           -Dsonar.host.url=$SONAR_HOST_URL
           -Dsonar.organization=$SONAR_ORGANIZATION
           -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
-          -Dsonar.qualitygate.wait=true
+          -Dsonar.qualitygate.wait=$QG_WAIT
           -Dsonar.qualitygate.timeout=300
 
   # ================================================================
-  # 7. DOCKER BUILD + SCAN DE L'IMAGE (Trivy) + IaC + SBOM
-  #    L'image n'est PAS poussée ici : elle doit d'abord passer le gate
+  # PHASE 8 - DOCKER BUILD + SCAN IMAGE + IaC + SBOM
   # ================================================================
   docker-build-scan:
     name: Docker Build + Image Scan
     runs-on: ubuntu-latest
-    needs: [build-test, secret-scan, sast, dependency-scan, sonarcloud]
+    needs: sonarcloud
     steps:
       - uses: actions/checkout@v4
 
@@ -290,8 +356,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan IaC (Dockerfile, docker-compose, k8s) - non bloquant
-        run: |
-          docker run --rm -w /work -v $PWD:/work $TRIVY_IMAGE config --exit-code 0 .
+        run: docker run --rm -w /work -v $PWD:/work $TRIVY_IMAGE config --exit-code 0 .
 
       - name: Rapports image (SARIF, HTML, JSON) + SBOM CycloneDX
         run: |
@@ -333,9 +398,7 @@ jobs:
           retention-days: 1
 
   # ================================================================
-  # 8. DAST - OWASP ZAP sur l'IMAGE EXACTE qui sera déployée
-  #    Même config que le staging (console H2 désactivée)
-  #    Non bloquant : scan passif, nombreux avertissements informatifs
+  # PHASE 9 - DAST - OWASP ZAP sur l'image exacte à déployer
   # ================================================================
   dast:
     name: DAST (OWASP ZAP)
@@ -382,12 +445,12 @@ jobs:
         run: docker logs app
 
   # ================================================================
-  # 9. PUSH DOCKER HUB (main uniquement) - tags SHA + latest
+  # PHASE 10 - PUSH DOCKER HUB (main uniquement) - tags SHA + latest
   # ================================================================
   docker-push:
     name: Push Docker Hub
     runs-on: ubuntu-latest
-    needs: [docker-build-scan, dast]
+    needs: dast
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/download-artifact@v4
@@ -411,7 +474,7 @@ jobs:
           docker push "$IMAGE_NAME:latest"
 
   # ================================================================
-  # 10. DEPLOIEMENT STAGING (Render) + SMOKE TEST
+  # PHASE 11 - DEPLOIEMENT STAGING (Render) + SMOKE TEST
   # ================================================================
   deploy-staging:
     name: Deploy Staging (Render)
@@ -449,36 +512,219 @@ jobs:
           exit $FAIL
 
   # ================================================================
-  # 11. NOTIFICATION SLACK EN CAS D'ECHEC
-  #     Ignorée tant que le secret SLACK_WEBHOOK_URL n'existe pas
+  # PHASE 12 - DEPLOIEMENT PRODUCTION SIMULEE (conteneur local)
+  # Runner self-hosted sur la machine de démo (Docker Desktop)
+  # Ancien conteneur arrêté -> nouveau démarré -> health check
+  # -> succès : suppression ancien conteneur + ancienne image
+  # -> échec  : ROLLBACK automatique vers l'ancienne version
+  # ================================================================
+  deploy-production:
+    name: Deploy Production (conteneur local)
+    runs-on: [self-hosted, Windows]
+    needs: deploy-staging
+    environment:
+      name: production
+      url: http://localhost:8081
+    steps:
+      - name: 1. Récupérer la nouvelle image validée
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $image = "$($env:IMAGE_NAME):$($env:GITHUB_SHA)"
+          Write-Host "Nouvelle image : $image"
+          docker pull $image
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: 2. Arrêter l'ancien conteneur (conservé pour rollback)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $name = $env:PROD_CONTAINER
+          $old  = "$name-old"
+          docker container inspect $old *> $null
+          if ($LASTEXITCODE -eq 0) { docker rm -f $old | Out-Null }
+          docker container inspect $name *> $null
+          if ($LASTEXITCODE -eq 0) {
+            $oldImage = docker inspect --format '{{.Config.Image}}' $name
+            Write-Host "Conteneur en service : $name (image $oldImage)"
+            docker stop $name | Out-Null
+            docker rename $name $old
+            Write-Host "Ancien conteneur ARRETE et renommé en $old"
+          } else {
+            Write-Host "Aucun conteneur en service : premier déploiement"
+          }
+          exit 0
+
+      - name: 3. Créer et démarrer le nouveau conteneur
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $image = "$($env:IMAGE_NAME):$($env:GITHUB_SHA)"
+          docker run -d --name $env:PROD_CONTAINER `
+            -p "$($env:PROD_PORT):8080" `
+            -e SPRING_H2_CONSOLE_ENABLED=false `
+            --restart unless-stopped `
+            $image
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host "Nouveau conteneur $($env:PROD_CONTAINER) démarré"
+
+      - name: 4. Health check + contrôles de sécurité
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $base = "http://localhost:$($env:PROD_PORT)"
+          $ok = $false
+          for ($i = 1; $i -le 36; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri $base -UseBasicParsing -TimeoutSec 5
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+            Write-Host "attente de l'application... ($i)"
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ok) { Write-Host "Application KO"; docker logs $env:PROD_CONTAINER; exit 1 }
+          Write-Host "Application OK sur $base"
+          $fail = $false
+          foreach ($p in @('/h2-console', '/actuator/env', '/actuator/heapdump')) {
+            $code = 0
+            try { $code = (Invoke-WebRequest -Uri "$base$p" -UseBasicParsing -TimeoutSec 10 -Method Head).StatusCode }
+            catch { if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode } }
+            Write-Host "$p -> HTTP $code"
+            if ($code -eq 200) { Write-Host "ERREUR : $p exposé"; $fail = $true }
+          }
+          if ($fail) { exit 1 }
+          exit 0
+
+      - name: 5. Supprimer l'ancien conteneur et l'ancienne image
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $old      = "$($env:PROD_CONTAINER)-old"
+          $newImage = "$($env:IMAGE_NAME):$($env:GITHUB_SHA)"
+          docker container inspect $old *> $null
+          if ($LASTEXITCODE -eq 0) {
+            $oldImage = docker inspect --format '{{.Config.Image}}' $old
+            docker rm -f $old | Out-Null
+            Write-Host "Ancien conteneur SUPPRIME : $old"
+            if ($oldImage -and $oldImage -ne $newImage) {
+              docker rmi $oldImage | Out-Null
+              Write-Host "Ancienne image SUPPRIMEE : $oldImage"
+            }
+          }
+          docker image prune -f | Out-Null
+          Write-Host ""
+          Write-Host "=== Etat après déploiement ==="
+          docker ps --filter "name=petclinic" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+          docker images $env:IMAGE_NAME
+          exit 0
+
+      - name: ROLLBACK - restaurer l'ancienne version
+        if: failure() || cancelled()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $name = $env:PROD_CONTAINER
+          $old  = "$name-old"
+          docker rm -f $name *> $null
+          docker container inspect $old *> $null
+          if ($LASTEXITCODE -eq 0) {
+            docker rename $old $name
+            docker start $name | Out-Null
+            Write-Host "ROLLBACK effectué : l'ancienne version est de nouveau en service"
+          } else {
+            Write-Host "Pas de version précédente : rien à restaurer"
+          }
+          exit 0
+
+  # ================================================================
+  # PHASE 13 - NOTIFICATION (à chaque run, succès ou échec)
+  # Résultat de chaque phase -> Slack + résumé GitHub
   # ================================================================
   notify:
     name: Notification
     runs-on: ubuntu-latest
     needs:
       [
-        build-test,
+        precommit-check,
         secret-scan,
+        build-test,
         sast,
         dependency-scan,
+        quality-scan,
         sonarcloud,
         docker-build-scan,
         dast,
         docker-push,
         deploy-staging,
+        deploy-production,
       ]
-    if: always() && contains(needs.*.result, 'failure')
+    if: always()
     env:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      NEEDS: ${{ toJSON(needs) }}
+      GLOBAL: ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 'ECHEC' || 'SUCCES' }}
     steps:
-      - name: Slack
-        if: env.SLACK_WEBHOOK_URL != ''
-        env:
-          NEEDS: ${{ toJSON(needs) }}
+      - name: Rapport du pipeline (Slack + résumé GitHub)
         run: |
-          FAILED=$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result=="failure") | .key' | paste -sd ", ")
-          TEXT=":rotating_light: Pipeline DevSecOps bloqué sur *${GITHUB_REPOSITORY}* (${GITHUB_REF_NAME})
-          Jobs en échec : ${FAILED}
-          Commit : ${GITHUB_SHA::7} par ${GITHUB_ACTOR}
-          ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          jq -n --arg text "$TEXT" '{text: $text}' | curl -fsS -X POST -H 'Content-type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+          icon() {
+            case "$1" in
+              success)   echo "✅" ;;
+              failure)   echo "❌" ;;
+              cancelled) echo "⛔" ;;
+              skipped)   echo "⏭️" ;;
+              *)         echo "❔" ;;
+            esac
+          }
+          PHASES="precommit-check|1. Pre-commit & messages de commit
+          secret-scan|2. Scan de secrets (Gitleaks)
+          build-test|3. Build & tests
+          sast|4. SAST (Semgrep)
+          dependency-scan|5. SCA dépendances (Trivy)
+          quality-scan|6. Qualité (SpotBugs + PMD)
+          sonarcloud|7. SonarCloud (quality gate)
+          docker-build-scan|8. Docker build + scan image
+          dast|9. DAST (OWASP ZAP)
+          docker-push|10. Push Docker Hub
+          deploy-staging|11. Déploiement staging (Render)
+          deploy-production|12. Déploiement prod (conteneur)"
+
+          REPORT=""
+          ROWS=""
+          while IFS='|' read -r id label; do
+            id=$(echo "$id" | xargs)
+            res=$(echo "$NEEDS" | jq -r --arg j "$id" '.[$j].result // "n/a"')
+            REPORT+="$(icon "$res") $label : $res"$'\n'
+            ROWS+="| $label | $(icon "$res") $res |"$'\n'
+          done <<< "$PHASES"
+
+          if [ "$GLOBAL" = "SUCCES" ]; then
+            TITLE="✅ Pipeline DevSecOps RÉUSSI"
+          else
+            TITLE="🚨 Pipeline DevSecOps EN ÉCHEC"
+          fi
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          MSG="*$TITLE*
+          Dépôt : $GITHUB_REPOSITORY  |  Branche : $GITHUB_REF_NAME
+          Commit : ${GITHUB_SHA::7} par $GITHUB_ACTOR ($GITHUB_EVENT_NAME)
+
+          $REPORT
+          Détails : $RUN_URL"
+
+          {
+            echo "## $TITLE"
+            echo ""
+            echo "Branche \`$GITHUB_REF_NAME\` - commit \`${GITHUB_SHA::7}\` par $GITHUB_ACTOR"
+            echo ""
+            echo "| Phase | Résultat |"
+            echo "|---|---|"
+            printf "%s" "$ROWS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            jq -n --arg text "$MSG" '{text: $text}' | \
+              curl -fsS -X POST -H 'Content-type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+            echo "Notification Slack envoyée"
+          else
+            echo "Secret SLACK_WEBHOOK_URL absent : notification Slack ignorée"
+          fi
