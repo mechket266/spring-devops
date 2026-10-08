@@ -2,23 +2,26 @@
 # Installation : pip install pre-commit && pre-commit install
 # -> installe le hook "pre-commit" ET le hook "commit-msg"
 default_install_hook_types: [pre-commit, commit-msg]
+# Par défaut, les hooks ne tournent qu'à l'étape pre-commit
+# (évite qu'ils soient rejoués à l'étape commit-msg)
+default_stages: [pre-commit]
 
 repos:
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.0
     hooks:
-      - id: gitleaks # bloque le commit si un secret est détecté
+      - id: gitleaks                  # bloque le commit si un secret est détecté
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
-      - id: detect-private-key # clés privées (RSA, SSH...)
+      - id: detect-private-key        # clés privées (RSA, SSH...)
       - id: check-added-large-files
       - id: check-merge-conflict
       - id: check-yaml
-        args: ["--allow-multiple-documents"]
-      - id: no-commit-to-branch # interdit de commiter directement sur main
-        args: ["--branch", "main"]
+        args: ['--allow-multiple-documents']
+      - id: no-commit-to-branch       # interdit de commiter directement sur main
+        args: ['--branch', 'main']
 
   # Message de commit obligatoire au format Conventional Commits :
   # type(scope): description   ex. fix(deps): montée de version tomcat

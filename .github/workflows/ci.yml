@@ -296,8 +296,8 @@ jobs:
         run: ./mvnw -B pmd:check
         continue-on-error: true
 
-  # ================================================================
-  # PHASE 7 - SONARCLOUD - couverture + quality gate (bloquant)
+    # ================================================================
+  # PHASE 7 - SONARCLOUD - couverture + quality gate (bloquant sur main)
   # ================================================================
   sonarcloud:
     name: SonarCloud Scan
@@ -322,13 +322,15 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+          # quality gate attendu uniquement sur main (limite offre gratuite)
+          QG_WAIT: ${{ github.ref == 'refs/heads/main' }}
         run: >
           ./mvnw -B test jacoco:report sonar:sonar
           -Dsonar.projectKey=mechket266_spring-devops
           -Dsonar.host.url=$SONAR_HOST_URL
           -Dsonar.organization=$SONAR_ORGANIZATION
           -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
-          -Dsonar.qualitygate.wait=${{ github.ref == 'refs/heads/main' }}
+          -Dsonar.qualitygate.wait=$QG_WAIT
           -Dsonar.qualitygate.timeout=300
 
   # ================================================================
